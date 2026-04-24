@@ -1,0 +1,5 @@
+numpy>=2.0
+opencv-python-headless>=4.10
+streamlit>=1.30
+scikit-image>=0.22
+pytoshop>=1.2.1
