@@ -142,6 +142,30 @@ def solid_swatch(color_hex: str, size: int = 76) -> np.ndarray:
     return np.full((size, size, 3), hex_to_bgr(color_hex), dtype=np.uint8)
 
 
+def default_code_library() -> list[dict[str, Any]]:
+    presets = [
+        ("BK", "#1F1F1F", "Black"),
+        ("WT", "#F7F7F2", "White"),
+        ("PK", "#F62FA7", "Pink"),
+        ("LP", "#FBAAE0", "Light Pink"),
+        ("GN", "#859A72", "Green"),
+        ("BL", "#39D7E6", "Blue"),
+    ]
+    entries: list[dict[str, Any]] = []
+    for code, hex_value, name in presets:
+        entries.append(
+            {
+                "token": code,
+                "name": name,
+                "hex": hex_value,
+                "lab": bgr_to_lab_color(hex_to_bgr(hex_value)),
+                "source": "code",
+                "swatch": solid_swatch(hex_value),
+            }
+        )
+    return entries
+
+
 def delta_e_lab(lab_a: np.ndarray, lab_b: np.ndarray) -> float:
     a = np.asarray(lab_a, dtype=np.float32).reshape(1, 1, 3)
     b = np.asarray(lab_b, dtype=np.float32).reshape(1, 1, 3)
@@ -493,52 +517,47 @@ def render_color_entries(title: str, entries: list[dict[str, Any]], show_ratio: 
 
 def collect_regions(base_bgr: np.ndarray, region_count: int) -> list[dict[str, Any]]:
     regions: list[dict[str, Any]] = []
-    st.markdown('<div class="compact-card"><div class="compact-title">3. 上传拆分区域</div><div class="mini-note">一个区域可以覆盖多个部位。如果两个部位同色，就放在同一张蒙版里。</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="compact-card"><div class="compact-title">3. 上传拆分区域</div><div class="mini-note">区域固定按“区域1、区域2...”命名。多个区域会并排显示，适合快速连传。</div></div>', unsafe_allow_html=True)
+    cols = st.columns(3)
     for index in range(region_count):
-        with st.expander(f"区域 {index + 1}", expanded=index < 2):
-            name = st.text_input("区域名", value=f"区域{index + 1}", key=f"region_name_{index}")
-            notes = st.text_input("区域说明", value="比如：上衣主体 / 腰头包边 / 牙边", key=f"region_notes_{index}")
-            mask_file = st.file_uploader("上传该区域蒙版", type=IMAGE_TYPES, key=f"region_mask_{index}")
+        with cols[index % 3]:
+            st.markdown(f"**区域 {index + 1}**")
+            mask_file = st.file_uploader("上传蒙版", type=IMAGE_TYPES, key=f"region_mask_{index}", label_visibility="collapsed")
             if mask_file is None:
-                st.warning("还没上传蒙版。")
+                st.caption("等待上传")
                 continue
             mask_raw = read_uploaded_image(mask_file)
             if mask_raw is None:
-                st.warning("蒙版读取失败。")
+                st.warning("蒙版读取失败")
                 continue
             mask_u8 = preprocess_mask(mask_raw, base_bgr.shape[:2])
             preview = cv2.bitwise_and(base_bgr, base_bgr, mask=(mask_u8 > 20).astype(np.uint8) * 255)
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                st.image(mask_u8, caption="蒙版", width=220)
-            with col2:
-                st.image(cv2.cvtColor(thumbnail_for_ui(preview, 220, 220), cv2.COLOR_BGR2RGB), caption="覆盖预览", width=220)
-            regions.append({"name": name.strip() or f"区域{index + 1}", "notes": notes.strip(), "mask": mask_u8})
+            sub_cols = st.columns(2)
+            with sub_cols[0]:
+                st.image(mask_u8, caption="蒙版", width=120)
+            with sub_cols[1]:
+                st.image(cv2.cvtColor(thumbnail_for_ui(preview, 120, 150), cv2.COLOR_BGR2RGB), caption="预览", width=120)
+            regions.append({"name": f"区域{index + 1}", "notes": "", "mask": mask_u8})
     return regions
 
 
 def collect_schemes(region_names: list[str], token_examples: list[str], scheme_count: int) -> list[dict[str, Any]]:
     schemes: list[dict[str, Any]] = []
-    st.markdown('<div class="compact-card"><div class="compact-title">4. 配方案</div><div class="mini-note">每个区域可以输入“颜色1 / 颜色2”、已有搭配编码，或直接输入 HEX。</div></div>', unsafe_allow_html=True)
-    example_text = "、".join(token_examples[:8]) if token_examples else "颜色1"
+    st.markdown('<div class="compact-card"><div class="compact-title">4. 配方案</div><div class="mini-note">方案固定按“方案1、方案2...”命名。每个区域直接选择颜色1或内置编码，如 BK、WT。</div></div>', unsafe_allow_html=True)
+    cols = st.columns(2)
     for index in range(scheme_count):
-        with st.expander(f"方案 {index + 1}", expanded=index < 2):
-            name = st.text_input("方案名", value=f"修色{index + 1}", key=f"scheme_name_{index}")
+        with cols[index % 2]:
+            st.markdown(f"**方案 {index + 1}**")
             assignments: dict[str, dict[str, str]] = {}
             for region_name in region_names:
-                left, right = st.columns([1, 1.2])
-                with left:
-                    quick_pick = st.selectbox(f"{region_name} 快速选", [""] + token_examples, key=f"scheme_pick_{index}_{slugify(region_name)}")
-                with right:
-                    manual_token = st.text_input(
-                        f"{region_name} 输入标识",
-                        value="",
-                        placeholder=f"如：颜色1 / A102 / #8AA379。示例：{example_text}",
-                        key=f"scheme_manual_{index}_{slugify(region_name)}",
-                    )
-                assignments[region_name] = {"token": manual_token.strip() or quick_pick}
-            notes = st.text_area("备注", value="", placeholder="比如：牙边参考颜色2；主体用 A102。", key=f"scheme_notes_{index}", height=90)
-            schemes.append({"name": name.strip() or f"修色{index + 1}", "assignments": assignments, "notes": notes})
+                quick_pick = st.selectbox(
+                    region_name,
+                    token_examples,
+                    key=f"scheme_pick_{index}_{slugify(region_name)}",
+                    index=min(index, max(len(token_examples) - 1, 0)) if token_examples else 0,
+                )
+                assignments[region_name] = {"token": quick_pick}
+            schemes.append({"name": f"修色{index + 1}", "assignments": assignments, "notes": ""})
     return schemes
 
 
@@ -546,10 +565,10 @@ def render_results(results: list[dict[str, Any]]) -> None:
     if not results:
         return
     st.markdown('<div class="compact-card"><div class="compact-title">5. 预览结果</div><div class="mini-note">每个方案都展示总 DeltaE 和分区域 DeltaE，方便快速判断哪一版更接近目标色。</div></div>', unsafe_allow_html=True)
-    cols = st.columns(2)
+    cols = st.columns(3)
     for index, item in enumerate(results):
-        with cols[index % 2]:
-            st.image(cv2.cvtColor(thumbnail_for_ui(item["image"], 430, 500), cv2.COLOR_BGR2RGB), caption=item["name"], use_container_width=False)
+        with cols[index % 3]:
+            st.image(cv2.cvtColor(thumbnail_for_ui(item["image"], 240, 320), cv2.COLOR_BGR2RGB), caption=item["name"], use_container_width=False)
             st.markdown(f'<div class="delta-pill">总 DeltaE {item["delta_e"]:.2f}</div>', unsafe_allow_html=True)
             st.caption(item["summary"])
             if item["region_delta_e"]:
@@ -578,10 +597,12 @@ def main() -> None:
         max_colors = int(st.number_input("参考图最多提取颜色数", min_value=1, max_value=10, value=4, step=1))
 
     st.markdown('<div class="compact-card"><div class="compact-title">1. 基础图与目标参考图</div></div>', unsafe_allow_html=True)
-    job_name = st.text_input("任务名", value="延展拆色任务")
-    base_file = st.file_uploader("上传基础图", type=IMAGE_TYPES, key="base_image")
-    reference_file = st.file_uploader("上传目标参考图", type=IMAGE_TYPES, key="reference_image")
-    reference_mask_file = st.file_uploader("可选：上传目标参考图的服装蒙版", type=IMAGE_TYPES, key="reference_mask")
+    job_name = "延展拆色任务"
+    upload_cols = st.columns(2)
+    with upload_cols[0]:
+        base_file = st.file_uploader("上传基础图", type=IMAGE_TYPES, key="base_image")
+    with upload_cols[1]:
+        reference_file = st.file_uploader("上传目标参考图", type=IMAGE_TYPES, key="reference_image")
 
     if base_file is None or reference_file is None:
         st.info("先上传基础图和目标参考图。")
@@ -596,29 +617,18 @@ def main() -> None:
     base_bgr = ensure_bgr(base_raw)
     reference_bgr = ensure_bgr(reference_raw)
     reference_mask = None
-    if reference_mask_file is not None:
-        mask_raw = read_uploaded_image(reference_mask_file)
-        if mask_raw is not None:
-            reference_mask = preprocess_mask(mask_raw, reference_bgr.shape[:2])
 
-    top_cols = st.columns([1, 1, 0.8])
+    top_cols = st.columns(2)
     with top_cols[0]:
-        st.image(cv2.cvtColor(thumbnail_for_ui(base_bgr, 300, 360), cv2.COLOR_BGR2RGB), caption="基础图", use_container_width=False)
+        st.image(cv2.cvtColor(thumbnail_for_ui(base_bgr, 260, 320), cv2.COLOR_BGR2RGB), caption="基础图", use_container_width=False)
     with top_cols[1]:
-        st.image(cv2.cvtColor(thumbnail_for_ui(reference_bgr, 300, 360), cv2.COLOR_BGR2RGB), caption="目标参考图", use_container_width=False)
-    with top_cols[2]:
-        if reference_mask is not None:
-            st.image(reference_mask, caption="参考图蒙版", width=240)
-        else:
-            st.info("如果想只从衣服区域拆色，建议上传一张参考图服装蒙版。")
+        st.image(cv2.cvtColor(thumbnail_for_ui(reference_bgr, 260, 320), cv2.COLOR_BGR2RGB), caption="目标参考图", use_container_width=False)
 
     reference_colors = extract_palette_from_reference(reference_bgr, reference_mask, max_colors=max_colors)
     render_color_entries("2. 参考图拆出的颜色", reference_colors, show_ratio=True)
 
-    st.markdown('<div class="compact-card"><div class="compact-title">已有搭配编码库</div><div class="mini-note">支持上传 CSV / TXT / JSON，或直接粘贴。推荐格式：编码,HEX,名称</div></div>', unsafe_allow_html=True)
-    code_file = st.file_uploader("上传搭配编码库", type=["csv", "txt", "json"], key="code_library")
-    manual_codes = st.text_area("或直接粘贴搭配编码", value="", height=120, placeholder="示例：\nA102,#859A72,军绿\nB305,#F7F7F2,米白")
-    code_library = parse_code_library(code_file, manual_codes)
+    st.markdown('<div class="compact-card"><div class="compact-title">已有搭配编码库</div><div class="mini-note">当前先内置样例编码，后面你给我正式数据后我再直接写进代码。当前样例：BK、WT、PK、LP、GN、BL。</div></div>', unsafe_allow_html=True)
+    code_library = default_code_library()
     render_color_entries("已有搭配编码", code_library, show_ratio=False)
 
     token_map = {normalize_token(item["token"]): item for item in reference_colors + code_library}
@@ -675,29 +685,10 @@ def main() -> None:
     results.sort(key=lambda item: item["delta_e"])
     render_results(results)
 
-    bottom_cols = st.columns(3)
+    bottom_cols = st.columns(1)
     bundle = build_export_zip(job_name, base_bgr, reference_bgr, reference_colors, code_library, regions, schemes, results)
-    contact_sheet = build_contact_sheet(results)
-    config_payload = {
-        "job_name": job_name,
-        "reference_colors": [{"token": item["token"], "hex": item["hex"], "ratio": item["ratio"]} for item in reference_colors],
-        "code_library": [{"token": item["token"], "hex": item["hex"], "name": item["name"]} for item in code_library],
-        "regions": [{"name": item["name"], "notes": item["notes"]} for item in regions],
-        "schemes": schemes,
-        "results": [{"name": item["name"], "delta_e": item["delta_e"], "region_delta_e": item["region_delta_e"]} for item in results],
-    }
     with bottom_cols[0]:
         st.download_button("下载整包 ZIP", bundle, file_name=f"{slugify(job_name)}_extend_bundle.zip", mime="application/zip", use_container_width=True)
-    with bottom_cols[1]:
-        st.download_button("下载联系表 JPG", image_to_jpg_bytes(contact_sheet), file_name=f"{slugify(job_name)}_contact_sheet.jpg", mime="image/jpeg", use_container_width=True)
-    with bottom_cols[2]:
-        st.download_button(
-            "下载配置 JSON",
-            json.dumps(config_payload, ensure_ascii=False, indent=2).encode("utf-8"),
-            file_name=f"{slugify(job_name)}_config.json",
-            mime="application/json",
-            use_container_width=True,
-        )
 
 
 if __name__ == "__main__":
