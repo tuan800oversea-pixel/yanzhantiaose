@@ -5,6 +5,7 @@ import io
 import json
 import re
 import zipfile
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -18,6 +19,7 @@ except Exception:  # pragma: no cover
 
 
 IMAGE_TYPES = ["jpg", "jpeg", "png", "webp"]
+COLOR_TABLE_PATH = Path(__file__).with_name("internal_color_hex_table_full_rows_by_fabric_code.csv")
 
 
 def inject_css() -> None:
@@ -138,8 +140,36 @@ def bgr_to_lab_color(color_bgr: tuple[int, int, int] | np.ndarray) -> np.ndarray
     return cv2.cvtColor(np.uint8([[list(color_bgr)]]), cv2.COLOR_BGR2LAB).astype(np.float32)[0, 0]
 
 
+def lab_to_bgr_color(lab_color: np.ndarray) -> np.ndarray:
+    lab = np.asarray(lab_color, dtype=np.float32).reshape(1, 1, 3)
+    return cv2.cvtColor(np.clip(lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)[0, 0]
+
+
 def solid_swatch(color_hex: str, size: int = 76) -> np.ndarray:
     return np.full((size, size, 3), hex_to_bgr(color_hex), dtype=np.uint8)
+
+
+def make_color_entry(
+    token: str,
+    hex_value: str,
+    *,
+    name: str | None = None,
+    source: str = "code",
+    swatch_size: int = 76,
+    **extra: Any,
+) -> dict[str, Any]:
+    if not hex_value.startswith("#"):
+        hex_value = "#" + hex_value
+    entry = {
+        "token": token,
+        "name": name or token,
+        "hex": hex_value.upper(),
+        "lab": bgr_to_lab_color(hex_to_bgr(hex_value)),
+        "source": source,
+        "swatch": solid_swatch(hex_value, size=swatch_size),
+    }
+    entry.update(extra)
+    return entry
 
 
 def default_code_library() -> list[dict[str, Any]]:
@@ -153,17 +183,145 @@ def default_code_library() -> list[dict[str, Any]]:
     ]
     entries: list[dict[str, Any]] = []
     for code, hex_value, name in presets:
+        entries.append(make_color_entry(code, hex_value, name=name, source="fallback"))
+    return entries
+
+
+def load_internal_code_library(csv_path: Path) -> list[dict[str, Any]]:
+    if not csv_path.exists():
+        return []
+
+    best_rows: dict[str, dict[str, Any]] = {}
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)
+        for row in reader:
+            if len(row) < 9:
+                continue
+            product_code = row[1].strip()
+            fabric_code = row[2].strip()
+            color_code = row[3].strip()
+            color_hex = row[5].strip().upper()
+            status = row[8].strip().upper()
+            if not product_code or not fabric_code or not color_code:
+                continue
+            if not re.fullmatch(r"#?[0-9A-Fa-f]{6}", color_hex):
+                continue
+            if status and status != "OK":
+                continue
+            if not color_hex.startswith("#"):
+                color_hex = "#" + color_hex
+            try:
+                confidence = float(row[6]) if row[6].strip() else 0.0
+            except ValueError:
+                confidence = 0.0
+            current = best_rows.get(product_code)
+            if current is None or confidence > current["confidence"]:
+                best_rows[product_code] = {
+                    "token": product_code,
+                    "name": product_code,
+                    "hex": color_hex,
+                    "source": "fabric_table",
+                    "fabric_code": fabric_code,
+                    "color_code": color_code,
+                    "reference_url": row[4].strip(),
+                    "confidence": confidence,
+                    "size": row[7].strip(),
+                }
+
+    entries: list[dict[str, Any]] = []
+    for _, payload in sorted(best_rows.items(), key=lambda item: item[0]):
         entries.append(
-            {
-                "token": code,
-                "name": name,
-                "hex": hex_value,
-                "lab": bgr_to_lab_color(hex_to_bgr(hex_value)),
-                "source": "code",
-                "swatch": solid_swatch(hex_value),
-            }
+            make_color_entry(
+                payload["token"],
+                payload["hex"],
+                name=payload["name"],
+                source=payload["source"],
+                fabric_code=payload["fabric_code"],
+                color_code=payload["color_code"],
+                reference_url=payload["reference_url"],
+                confidence=payload["confidence"],
+                size=payload["size"],
+            )
         )
     return entries
+
+
+def filter_code_library(entries: list[dict[str, Any]], fabric_code: str) -> list[dict[str, Any]]:
+    fabric = fabric_code.strip().upper()
+    return [item for item in entries if item.get("fabric_code", "").upper() == fabric]
+
+
+def build_token_map(reference_colors: list[dict[str, Any]], code_library: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    token_map: dict[str, dict[str, Any]] = {}
+
+    def register(token: str, entry: dict[str, Any]) -> None:
+        key = normalize_token(token)
+        if key and key not in token_map:
+            token_map[key] = entry
+
+    for entry in reference_colors:
+        register(entry["token"], entry)
+
+    color_alias_groups: dict[str, list[dict[str, Any]]] = {}
+    for entry in code_library:
+        register(entry["token"], entry)
+        color_code = entry.get("color_code", "").strip()
+        if color_code:
+            color_alias_groups.setdefault(normalize_token(color_code), []).append(entry)
+
+    for alias, matches in color_alias_groups.items():
+        if len(matches) == 1 and alias not in token_map:
+            token_map[alias] = matches[0]
+    return token_map
+
+
+def build_option_labels(reference_colors: list[dict[str, Any]], code_library: list[dict[str, Any]]) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for entry in reference_colors:
+        ratio = f"{entry.get('ratio', 0):.0%}" if entry.get("ratio") is not None else ""
+        labels[entry["token"]] = f"{entry['token']} · {entry['hex']} {ratio}".strip()
+    for entry in code_library:
+        labels[entry["token"]] = f"{entry['token']} · {entry.get('color_code', '')} · {entry['hex']}".strip()
+    return labels
+
+
+def build_nearby_color_entries(entry: dict[str, Any], count: int = 3) -> list[dict[str, Any]]:
+    adjustments = [
+        ("原色", 0.0, 0.0, 0.0),
+        ("偏亮", 8.0, 0.0, 0.0),
+        ("偏深", -8.0, 0.0, 0.0),
+        ("偏暖", 3.0, 4.0, 4.0),
+        ("偏冷", 3.0, -4.0, -4.0),
+    ]
+    base_lab = np.asarray(entry["lab"], dtype=np.float32).copy()
+    results: list[dict[str, Any]] = []
+    seen_hex: set[str] = set()
+    for label, delta_l, delta_a, delta_b in adjustments:
+        lab = base_lab.copy()
+        lab[0] = np.clip(lab[0] + delta_l, 36, 232)
+        lab[1] = np.clip(lab[1] + delta_a, 18, 238)
+        lab[2] = np.clip(lab[2] + delta_b, 18, 238)
+        color_hex = bgr_to_hex(lab_to_bgr_color(lab))
+        if color_hex in seen_hex:
+            continue
+        seen_hex.add(color_hex)
+        variant_token = entry["token"] if label == "原色" else f"{entry['token']}·{label}"
+        variant = make_color_entry(
+            variant_token,
+            color_hex,
+            name=entry.get("name", entry["token"]),
+            source=f"{entry.get('source', 'code')}_nearby",
+            fabric_code=entry.get("fabric_code", ""),
+            color_code=entry.get("color_code", ""),
+            variant_label=label,
+            base_token=entry["token"],
+            display=f"{entry['token']} {label}",
+        )
+        results.append(variant)
+        if len(results) >= count:
+            break
+    return results
 
 
 def delta_e_lab(lab_a: np.ndarray, lab_b: np.ndarray) -> float:
@@ -372,6 +530,21 @@ def resolve_token_to_color(token: str, token_map: dict[str, dict[str, Any]]) -> 
     return token_map.get(normalize_token(text))
 
 
+def resolve_assignment_to_color(payload: dict[str, str], token_map: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    direct_hex = payload.get("hex", "").strip()
+    if re.fullmatch(r"#?[0-9A-Fa-f]{6}", direct_hex):
+        return make_color_entry(
+            payload.get("token", direct_hex) or direct_hex,
+            direct_hex,
+            name=payload.get("name", payload.get("token", direct_hex) or direct_hex),
+            source="assignment",
+            variant_label=payload.get("variant_label", "原色"),
+            base_token=payload.get("base_token", payload.get("token", direct_hex)),
+            display=payload.get("display", payload.get("token", direct_hex) or direct_hex),
+        )
+    return resolve_token_to_color(payload.get("token", ""), token_map)
+
+
 def recolor_region(base_bgr: np.ndarray, mask_u8: np.ndarray, target_hex: str) -> tuple[np.ndarray, float]:
     original = ensure_bgr(base_bgr)
     mask = np.clip(mask_u8.astype(np.float32) / 255.0, 0.0, 1.0)
@@ -417,10 +590,10 @@ def render_scheme(base_image: np.ndarray, mask_specs: list[dict[str, Any]], assi
     output = ensure_bgr(base_image).copy()
     region_scores: dict[str, float] = {}
     for spec in mask_specs:
-        token = assignments.get(spec["name"], {}).get("token", "").strip()
-        if not token:
+        payload = assignments.get(spec["name"], {})
+        if not payload:
             continue
-        color_entry = resolve_token_to_color(token, token_map)
+        color_entry = resolve_assignment_to_color(payload, token_map)
         if color_entry is None:
             continue
         output, delta_e = recolor_region(output, spec["mask"], color_entry["hex"])
@@ -498,21 +671,28 @@ def build_export_zip(
     return memory.getvalue()
 
 
-def render_color_entries(title: str, entries: list[dict[str, Any]], show_ratio: bool = False) -> None:
+def render_color_entries(title: str, entries: list[dict[str, Any]], show_ratio: bool = False, max_display: int = 24) -> None:
     st.markdown(f'<div class="compact-card"><div class="compact-title">{title}</div></div>', unsafe_allow_html=True)
     if not entries:
         st.info("当前没有可用颜色。")
         return
-    cols = st.columns(6)
-    for index, entry in enumerate(entries):
-        with cols[index % 6]:
-            st.image(cv2.cvtColor(entry["swatch"], cv2.COLOR_BGR2RGB), width=76)
+    if len(entries) > max_display:
+        st.caption(f"共 {len(entries)} 个候选，仅展示前 {max_display} 个；下拉框里可搜索全量成品编码。")
+    cols = st.columns(8)
+    for index, entry in enumerate(entries[:max_display]):
+        with cols[index % 8]:
+            st.image(cv2.cvtColor(entry["swatch"], cv2.COLOR_BGR2RGB), width=60)
             label = f"{entry['token']} {entry['hex']}"
             if show_ratio:
                 label += f"  {entry['ratio']:.0%}"
             st.caption(label)
-            if entry.get("name") and entry["name"] != entry["token"]:
-                st.caption(entry["name"])
+            meta_parts = []
+            if entry.get("color_code"):
+                meta_parts.append(entry["color_code"])
+            if entry.get("fabric_code"):
+                meta_parts.append(entry["fabric_code"])
+            if meta_parts:
+                st.caption(" / ".join(meta_parts))
 
 
 def collect_regions(base_bgr: np.ndarray, region_count: int) -> list[dict[str, Any]]:
@@ -541,12 +721,19 @@ def collect_regions(base_bgr: np.ndarray, region_count: int) -> list[dict[str, A
     return regions
 
 
-def collect_schemes(region_names: list[str], token_examples: list[str], scheme_count: int) -> list[dict[str, Any]]:
+def collect_schemes(
+    region_names: list[str],
+    token_examples: list[str],
+    option_labels: dict[str, str],
+    token_map: dict[str, dict[str, Any]],
+    scheme_count: int,
+    nearby_count: int,
+) -> list[dict[str, Any]]:
     schemes: list[dict[str, Any]] = []
-    st.markdown('<div class="compact-card"><div class="compact-title">4. 配方案</div><div class="mini-note">方案固定按“方案1、方案2...”命名。每个区域直接选择颜色1或内置编码，如 BK、WT。</div></div>', unsafe_allow_html=True)
-    cols = st.columns(2)
+    st.markdown('<div class="compact-card"><div class="compact-title">4. 配方案</div><div class="mini-note">按成品编码选色，默认会自动带出“原色 + 临近色”候选，方便同学一键多版对比。</div></div>', unsafe_allow_html=True)
+    cols = st.columns(min(max(scheme_count, 1), 4))
     for index in range(scheme_count):
-        with cols[index % 2]:
+        with cols[index % len(cols)]:
             st.markdown(f"**方案 {index + 1}**")
             assignments: dict[str, dict[str, str]] = {}
             for region_name in region_names:
@@ -555,20 +742,81 @@ def collect_schemes(region_names: list[str], token_examples: list[str], scheme_c
                     token_examples,
                     key=f"scheme_pick_{index}_{slugify(region_name)}",
                     index=min(index, max(len(token_examples) - 1, 0)) if token_examples else 0,
+                    format_func=lambda token: option_labels.get(token, token),
                 )
                 assignments[region_name] = {"token": quick_pick}
+                selected_entry = resolve_token_to_color(quick_pick, token_map)
+                if selected_entry is not None:
+                    previews = build_nearby_color_entries(selected_entry, count=max(nearby_count + 1, 3))[: nearby_count + 1]
+                    preview_cols = st.columns(len(previews))
+                    for preview_index, preview in enumerate(previews):
+                        with preview_cols[preview_index]:
+                            st.image(cv2.cvtColor(preview["swatch"], cv2.COLOR_BGR2RGB), width=34)
+                            st.caption(preview.get("variant_label", "原色"))
             schemes.append({"name": f"修色{index + 1}", "assignments": assignments, "notes": ""})
     return schemes
+
+
+def expand_scheme_variants(
+    scheme: dict[str, Any],
+    token_map: dict[str, dict[str, Any]],
+    nearby_count: int,
+) -> list[dict[str, Any]]:
+    base_assignments = scheme.get("assignments", {})
+    variant_pool: dict[str, list[dict[str, Any]]] = {}
+    for region_name, payload in base_assignments.items():
+        entry = resolve_token_to_color(payload.get("token", ""), token_map)
+        if entry is None:
+            continue
+        variant_pool[region_name] = build_nearby_color_entries(entry, count=max(nearby_count + 1, 1))
+
+    variants: list[dict[str, Any]] = []
+    base_variant_assignments: dict[str, dict[str, str]] = {}
+    for region_name, options in variant_pool.items():
+        chosen = options[0]
+        base_variant_assignments[region_name] = {
+            "token": chosen["token"],
+            "hex": chosen["hex"],
+            "name": chosen["name"],
+            "variant_label": chosen.get("variant_label", "原色"),
+            "base_token": chosen.get("base_token", chosen["token"]),
+            "display": chosen.get("display", chosen["token"]),
+        }
+    variants.append({"name": scheme["name"], "assignments": base_variant_assignments, "notes": "原色"})
+
+    for variant_index in range(1, nearby_count + 1):
+        assignments: dict[str, dict[str, str]] = {}
+        changed = False
+        for region_name, options in variant_pool.items():
+            chosen = options[min(variant_index, len(options) - 1)]
+            assignments[region_name] = {
+                "token": chosen["token"],
+                "hex": chosen["hex"],
+                "name": chosen["name"],
+                "variant_label": chosen.get("variant_label", f"近邻{variant_index}"),
+                "base_token": chosen.get("base_token", chosen["token"]),
+                "display": chosen.get("display", chosen["token"]),
+            }
+            changed = changed or chosen["hex"] != options[0]["hex"]
+        if changed:
+            variants.append(
+                {
+                    "name": f"{scheme['name']}-近邻{variant_index}",
+                    "assignments": assignments,
+                    "notes": f"自动临近候选 {variant_index}",
+                }
+            )
+    return variants
 
 
 def render_results(results: list[dict[str, Any]]) -> None:
     if not results:
         return
     st.markdown('<div class="compact-card"><div class="compact-title">5. 预览结果</div><div class="mini-note">每个方案都展示总 DeltaE 和分区域 DeltaE，方便快速判断哪一版更接近目标色。</div></div>', unsafe_allow_html=True)
-    cols = st.columns(3)
+    cols = st.columns(4)
     for index, item in enumerate(results):
-        with cols[index % 3]:
-            st.image(cv2.cvtColor(thumbnail_for_ui(item["image"], 240, 320), cv2.COLOR_BGR2RGB), caption=item["name"], use_container_width=False)
+        with cols[index % 4]:
+            st.image(cv2.cvtColor(thumbnail_for_ui(item["image"], 190, 250), cv2.COLOR_BGR2RGB), caption=item["name"], use_container_width=False)
             st.markdown(f'<div class="delta-pill">总 DeltaE {item["delta_e"]:.2f}</div>', unsafe_allow_html=True)
             st.caption(item["summary"])
             if item["region_delta_e"]:
@@ -588,16 +836,26 @@ def main() -> None:
     st.set_page_config(page_title="延展拆色修图台", layout="wide")
     inject_css()
     st.title("延展拆色修图台")
-    st.caption("从目标参考图自动拆出颜色，区域方案直接引用“颜色1 / 搭配编码 / HEX”，并对每个方案计算色差。")
+    st.caption("从目标参考图自动拆出颜色，方案优先按成品编码选色；默认基础面料编号 JL1，可切换；每个方案自动附带临近色候选方便线上筛图。")
+
+    full_code_library = load_internal_code_library(COLOR_TABLE_PATH)
+    fabric_options = sorted({item.get("fabric_code", "") for item in full_code_library if item.get("fabric_code")})
+    default_fabric_index = fabric_options.index("JL1") if "JL1" in fabric_options else 0
 
     with st.sidebar:
         st.header("配置")
+        if fabric_options:
+            selected_fabric_code = st.selectbox("基础面料编号", fabric_options, index=default_fabric_index)
+        else:
+            selected_fabric_code = "JL1"
+            st.caption("未读取到本地颜色表，先使用内置样例编码。")
         region_count = int(st.number_input("区域数量", min_value=1, max_value=12, value=4, step=1))
         scheme_count = int(st.number_input("方案数量", min_value=1, max_value=12, value=2, step=1))
         max_colors = int(st.number_input("参考图最多提取颜色数", min_value=1, max_value=10, value=4, step=1))
+        nearby_count = int(st.number_input("每个方案自动附带临近色数量", min_value=0, max_value=4, value=2, step=1))
 
     st.markdown('<div class="compact-card"><div class="compact-title">1. 基础图与目标参考图</div></div>', unsafe_allow_html=True)
-    job_name = "延展拆色任务"
+    job_name = f"延展拆色任务_{selected_fabric_code}"
     upload_cols = st.columns(2)
     with upload_cols[0]:
         base_file = st.file_uploader("上传基础图", type=IMAGE_TYPES, key="base_image")
@@ -627,31 +885,47 @@ def main() -> None:
     reference_colors = extract_palette_from_reference(reference_bgr, reference_mask, max_colors=max_colors)
     render_color_entries("2. 参考图拆出的颜色", reference_colors, show_ratio=True)
 
-    st.markdown('<div class="compact-card"><div class="compact-title">已有搭配编码库</div><div class="mini-note">当前先内置样例编码，后面你给我正式数据后我再直接写进代码。当前样例：BK、WT、PK、LP、GN、BL。</div></div>', unsafe_allow_html=True)
-    code_library = default_code_library()
-    render_color_entries("已有搭配编码", code_library, show_ratio=False)
+    filtered_code_library = filter_code_library(full_code_library, selected_fabric_code) if full_code_library else []
+    if not filtered_code_library:
+        filtered_code_library = default_code_library()
+        st.warning(f"颜色表里暂时没有基础面料编号 {selected_fabric_code} 的记录，已回退到内置样例编码。")
 
-    token_map = {normalize_token(item["token"]): item for item in reference_colors + code_library}
-    token_examples = [item["token"] for item in reference_colors] + [item["token"] for item in code_library]
+    st.markdown(
+        f'<div class="compact-card"><div class="compact-title">成品编码色库</div><div class="mini-note">当前按基础面料编号 {selected_fabric_code} 展示，方案下拉框里可直接搜索成品面料内部编号。</div></div>',
+        unsafe_allow_html=True,
+    )
+    render_color_entries(f"成品编码（{selected_fabric_code}）", filtered_code_library, show_ratio=False, max_display=24)
+
+    token_map = build_token_map(reference_colors, filtered_code_library)
+    option_labels = build_option_labels(reference_colors, filtered_code_library)
+    token_examples = [item["token"] for item in reference_colors] + [item["token"] for item in filtered_code_library]
 
     regions = collect_regions(base_bgr, region_count)
     if not regions:
         st.warning("至少需要 1 个有效区域蒙版。")
         return
 
-    schemes = collect_schemes([item["name"] for item in regions], token_examples, scheme_count)
+    schemes = collect_schemes(
+        [item["name"] for item in regions],
+        token_examples,
+        option_labels,
+        token_map,
+        scheme_count,
+        nearby_count,
+    )
 
     if not st.button("生成方案预览", type="primary", use_container_width=True):
         return
 
     unresolved: list[str] = []
     for scheme in schemes:
-        for region_name, payload in scheme["assignments"].items():
-            token = payload.get("token", "").strip()
-            if not token:
-                continue
-            if resolve_token_to_color(token, token_map) is None:
-                unresolved.append(f"{scheme['name']} / {region_name}: {token}")
+        for variant in expand_scheme_variants(scheme, token_map, nearby_count):
+            for region_name, payload in variant["assignments"].items():
+                token = payload.get("token", "").strip()
+                if not token and not payload.get("hex", "").strip():
+                    continue
+                if resolve_assignment_to_color(payload, token_map) is None:
+                    unresolved.append(f"{variant['name']} / {region_name}: {token}")
 
     if unresolved:
         st.error("下面这些颜色标识无法识别，请改成“颜色1/颜色2”、已有搭配编码，或直接填 HEX：")
@@ -661,32 +935,32 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     for scheme in schemes:
-        rendered, region_delta_e = render_scheme(base_bgr, regions, scheme["assignments"], token_map)
-        parts: list[str] = []
-        for region_name, payload in scheme["assignments"].items():
-            token = payload.get("token", "").strip()
-            if not token:
-                continue
-            color_entry = resolve_token_to_color(token, token_map)
-            if color_entry is None:
-                continue
-            parts.append(f"{region_name}={token}({color_entry['hex']})")
-        total_delta_e = float(np.mean(list(region_delta_e.values()))) if region_delta_e else 0.0
-        results.append(
-            {
-                "name": scheme["name"],
-                "summary": " / ".join(parts),
-                "image": rendered,
-                "delta_e": total_delta_e,
-                "region_delta_e": region_delta_e,
-            }
-        )
+        for variant in expand_scheme_variants(scheme, token_map, nearby_count):
+            rendered, region_delta_e = render_scheme(base_bgr, regions, variant["assignments"], token_map)
+            parts: list[str] = []
+            for region_name, payload in variant["assignments"].items():
+                color_entry = resolve_assignment_to_color(payload, token_map)
+                if color_entry is None:
+                    continue
+                variant_label = payload.get("variant_label", "原色")
+                base_token = payload.get("base_token", payload.get("token", ""))
+                parts.append(f"{region_name}={base_token}[{variant_label}]({color_entry['hex']})")
+            total_delta_e = float(np.mean(list(region_delta_e.values()))) if region_delta_e else 0.0
+            results.append(
+                {
+                    "name": variant["name"],
+                    "summary": " / ".join(parts),
+                    "image": rendered,
+                    "delta_e": total_delta_e,
+                    "region_delta_e": region_delta_e,
+                }
+            )
 
     results.sort(key=lambda item: item["delta_e"])
     render_results(results)
 
     bottom_cols = st.columns(1)
-    bundle = build_export_zip(job_name, base_bgr, reference_bgr, reference_colors, code_library, regions, schemes, results)
+    bundle = build_export_zip(job_name, base_bgr, reference_bgr, reference_colors, filtered_code_library, regions, schemes, results)
     with bottom_cols[0]:
         st.download_button("下载整包 ZIP", bundle, file_name=f"{slugify(job_name)}_extend_bundle.zip", mime="application/zip", use_container_width=True)
 
