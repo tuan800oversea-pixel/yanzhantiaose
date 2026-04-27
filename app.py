@@ -434,10 +434,28 @@ def build_reference_garment_mask(reference_bgr: np.ndarray) -> np.ndarray:
     cloth_like = ((sat > 26) | (val < 160) | (gray < 205))
     candidate = (focus > 0) & (~near_white_bg) & (~skin) & cloth_like
 
-    mask = (candidate.astype(np.uint8) * 255)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
-    mask = cv2.GaussianBlur(mask, (0, 0), 1.4)
+    raw_mask = (candidate.astype(np.uint8) * 255)
+    raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8), iterations=1)
+    raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+
+    keep = np.zeros_like(raw_mask)
+    count, labels, stats, centroids = cv2.connectedComponentsWithStats((raw_mask > 0).astype(np.uint8), connectivity=8)
+    ranked: list[tuple[int, int]] = []
+    for component_id in range(1, count):
+        area = int(stats[component_id, cv2.CC_STAT_AREA])
+        if area < max(120, int(h * w * 0.0035)):
+            continue
+        cx, cy = centroids[component_id]
+        if cy < h * 0.10 or cy > h * 0.97:
+            continue
+        if cx < w * 0.04 or cx > w * 0.96:
+            continue
+        ranked.append((area, component_id))
+    ranked.sort(reverse=True)
+    for _, component_id in ranked[:4]:
+        keep[labels == component_id] = 255
+
+    mask = cv2.GaussianBlur(keep, (0, 0), 1.4)
 
     if int(mask.mean()) < 6:
         fallback = ((focus > 0) & (~near_white_bg) & ((sat > 20) | (val < 175))).astype(np.uint8) * 255
@@ -482,6 +500,19 @@ def extract_palette_from_reference(reference_bgr: np.ndarray, mask_u8: np.ndarra
         if len(cluster_pixels) < 70:
             continue
         center_lab = centers[index]
+        cluster_bgr = cv2.cvtColor(np.uint8([[center_lab]]), cv2.COLOR_LAB2BGR)[0, 0]
+        ycrcb = cv2.cvtColor(np.uint8([[cluster_bgr]]), cv2.COLOR_BGR2YCrCb)[0, 0]
+        hsv = cv2.cvtColor(np.uint8([[cluster_bgr]]), cv2.COLOR_BGR2HSV)[0, 0]
+        gray = int(round(float(np.mean(cluster_bgr))))
+        is_skin_like = (
+            133 <= int(ycrcb[1]) <= 176
+            and 76 <= int(ycrcb[2]) <= 128
+            and int(ycrcb[0]) > 55
+            and int(hsv[1]) < 110
+            and gray > 70
+        )
+        if is_skin_like:
+            continue
         groups.append({"lab": center_lab.astype(np.float32), "count": int(len(cluster_pixels))})
 
     groups.sort(key=lambda item: item["count"], reverse=True)
@@ -797,23 +828,51 @@ def render_code_library_overview(title: str, entries: list[dict[str, Any]], max_
             st.code(token, language=None)
 
 
+def merge_region_masks(mask_images: list[np.ndarray], target_hw: tuple[int, int]) -> np.ndarray | None:
+    merged: np.ndarray | None = None
+    for mask_image in mask_images:
+        processed = preprocess_mask(mask_image, target_hw)
+        if merged is None:
+            merged = processed.astype(np.uint8)
+        else:
+            merged = np.maximum(merged, processed.astype(np.uint8))
+    if merged is None:
+        return None
+    merged = cv2.medianBlur(merged, 5)
+    return cv2.GaussianBlur(merged, (0, 0), 1.2)
+
+
 def collect_regions(base_bgr: np.ndarray, region_count: int) -> list[dict[str, Any]]:
     regions: list[dict[str, Any]] = []
-    st.markdown('<div class="compact-card"><div class="compact-title">3. 上传拆分区域</div><div class="mini-note">区域固定按“区域1、区域2...”命名。多个区域会并排显示，适合快速连传。</div></div>', unsafe_allow_html=True)
+    st.markdown('<div class="compact-card"><div class="compact-title">3. 上传拆分区域</div><div class="mini-note">同一区域可以上传多张蒙版，系统会自动合并为一个区域。</div></div>', unsafe_allow_html=True)
     cols = st.columns(3)
     for index in range(region_count):
         with cols[index % 3]:
             st.markdown(f"**区域 {index + 1}**")
-            mask_file = st.file_uploader("上传蒙版", type=IMAGE_TYPES, key=f"region_mask_{index}", label_visibility="collapsed")
-            if mask_file is None:
+            mask_files = st.file_uploader(
+                "上传蒙版",
+                type=IMAGE_TYPES,
+                key=f"region_mask_{index}",
+                accept_multiple_files=True,
+                label_visibility="collapsed",
+            )
+            if not mask_files:
                 st.caption("等待上传")
                 continue
-            mask_raw = read_uploaded_image(mask_file)
-            if mask_raw is None:
+            mask_images: list[np.ndarray] = []
+            for mask_file in mask_files:
+                mask_raw = read_uploaded_image(mask_file)
+                if mask_raw is not None:
+                    mask_images.append(mask_raw)
+            if not mask_images:
                 st.warning("蒙版读取失败")
                 continue
-            mask_u8 = preprocess_mask(mask_raw, base_bgr.shape[:2])
+            mask_u8 = merge_region_masks(mask_images, base_bgr.shape[:2])
+            if mask_u8 is None:
+                st.warning("蒙版合并失败")
+                continue
             preview = cv2.bitwise_and(base_bgr, base_bgr, mask=(mask_u8 > 20).astype(np.uint8) * 255)
+            st.caption(f"已上传 {len(mask_images)} 张")
             sub_cols = st.columns(2)
             with sub_cols[0]:
                 st.image(mask_u8, caption="蒙版", width=96)
@@ -874,7 +933,7 @@ def collect_schemes(
                     }
                 else:
                     assignments[region_name] = {"token": quick_pick}
-            schemes.append({"name": f"修色{index + 1}", "assignments": assignments, "notes": ""})
+            schemes.append({"name": f"图片{index + 1}", "assignments": assignments, "notes": "", "display_order": index})
     return schemes
 
 
@@ -905,7 +964,7 @@ def main() -> None:
     st.set_page_config(page_title="延展拆色修图台", layout="wide")
     inject_css()
     st.title("延展拆色修图台")
-    st.caption("从目标参考图自动拆出颜色，方案优先按成品编码选色；默认基础面料编号 JL1，可切换；每个方案自动附带临近色候选方便线上筛图。")
+    st.caption("从目标参考图自动拆出衣服颜色，方案可按成品编码或参考色选色；默认基础面料编号 JL1，可切换。")
 
     full_code_library = load_internal_code_library(COLOR_TABLE_PATH)
     fabric_options = sorted({item.get("fabric_code", "") for item in full_code_library if item.get("fabric_code")})
@@ -959,12 +1018,6 @@ def main() -> None:
         filtered_code_library = default_code_library()
         st.warning(f"颜色表里暂时没有基础面料编号 {selected_fabric_code} 的记录，已回退到内置样例编码。")
 
-    st.markdown(
-        f'<div class="compact-card"><div class="compact-title">成品编码色库</div><div class="mini-note">当前按基础面料编号 {selected_fabric_code} 展示。这里不再直接铺大量色块，避免旧表中的肤色干扰；实际颜色会在你选中成品编码时，优先按参考图重新提取衣服主体色。</div></div>',
-        unsafe_allow_html=True,
-    )
-    render_code_library_overview(f"成品编码（{selected_fabric_code}）", filtered_code_library, max_display=18)
-
     token_map = build_token_map(reference_colors, filtered_code_library)
     option_labels = build_option_labels(reference_colors, filtered_code_library)
     token_examples = [item["token"] for item in reference_colors] + [item["token"] for item in filtered_code_library]
@@ -1016,6 +1069,7 @@ def main() -> None:
         results.append(
             {
                 "name": scheme["name"],
+                "display_order": scheme.get("display_order", 0),
                 "summary": " / ".join(parts),
                 "image": rendered,
                 "delta_e": total_delta_e,
@@ -1023,7 +1077,7 @@ def main() -> None:
             }
         )
 
-    results.sort(key=lambda item: item["delta_e"])
+    results.sort(key=lambda item: item.get("display_order", 0))
     render_results(results)
 
     bottom_cols = st.columns(1)
